@@ -1,0 +1,481 @@
+#include <iostream>
+#include <vector>
+#include <cmath>
+#include <random>
+#include <cassert>
+#include <algorithm>
+// ========== 활성화 함수 ========== //
+inline float sigmoid(float x) {
+   return 1.0f / (1.0f + std::exp(-x));
+}
+inline float dsigmoid(float s) {
+   // s = sigmoid(x)
+   return s * (1.0f - s);
+}
+inline float tanhf_custom(float x) {
+   return std::tanh(x);
+}
+inline float dtanhf(float t) {
+   // t = tanh(x)
+   return 1.0f - t * t;
+}
+// ========== 소프트맥스 & 크로스 엔트로피 ========== //
+std::vector<float> softmax(const std::vector<float>& logits) {
+   float maxLogit = *std::max_element(logits.begin(), logits.end());
+   float sumExp = 0.0f;
+   for (auto& l : logits) {
+       sumExp += std::exp(l - maxLogit);
+   }
+   std::vector<float> probs(logits.size());
+   for (size_t i = 0; i < logits.size(); i++) {
+       probs[i] = std::exp(logits[i] - maxLogit) / sumExp;
+   }
+   return probs;
+}
+float cross_entropy(const std::vector<float>& probs, int label) {
+   // label은 정답 클래스 index
+   // -log(prob[label])
+   float p = std::max(probs[label], 1e-7f);
+   return -std::log(p);
+}
+// ========== LSTM 파라미터 구조체 ========== //
+// [Wf, Wi, Wc, Wo]는 (hidden_dim + input_dim) x hidden_dim 형태
+// [bf, bi, bc, bo]는 hidden_dim 형태
+struct LSTMParam {
+   int input_dim;
+   int hidden_dim;
+   std::vector<float> Wf, Wi, Wc, Wo;
+   std::vector<float> bf, bi, bc, bo;
+   // 역전파 시 임시로 쓸 Gradient 버퍼 (누적)
+   std::vector<float> dWf, dWi, dWc, dWo;
+   std::vector<float> dbf, dbi, dbc, dbo;
+   LSTMParam(int in_dim, int hid_dim)
+       : input_dim(in_dim), hidden_dim(hid_dim)
+   {
+       size_t gateSize = (input_dim + hidden_dim) * hidden_dim;
+       Wf.resize(gateSize); Wi.resize(gateSize);
+       Wc.resize(gateSize); Wo.resize(gateSize);
+       bf.resize(hidden_dim); bi.resize(hidden_dim);
+       bc.resize(hidden_dim); bo.resize(hidden_dim);
+       dWf.resize(gateSize, 0.0f); dWi.resize(gateSize, 0.0f);
+       dWc.resize(gateSize, 0.0f); dWo.resize(gateSize, 0.0f);
+       dbf.resize(hidden_dim, 0.0f); dbi.resize(hidden_dim, 0.0f);
+       dbc.resize(hidden_dim, 0.0f); dbo.resize(hidden_dim, 0.0f);
+       // 간단한 난수 초기화
+       std::mt19937 gen(123);
+       std::uniform_real_distribution<float> dist(-0.1f, 0.1f);
+       auto initFunc = [&](std::vector<float>& vec) {
+           for (auto& v : vec) {
+               v = dist(gen);
+           }
+           };
+       initFunc(Wf); initFunc(Wi); initFunc(Wc); initFunc(Wo);
+       initFunc(bf); initFunc(bi); initFunc(bc); initFunc(bo);
+   }
+   // 모든 dW, db를 0으로 초기화
+   void zero_grad() {
+       std::fill(dWf.begin(), dWf.end(), 0.0f);
+       std::fill(dWi.begin(), dWi.end(), 0.0f);
+       std::fill(dWc.begin(), dWc.end(), 0.0f);
+       std::fill(dWo.begin(), dWo.end(), 0.0f);
+       std::fill(dbf.begin(), dbf.end(), 0.0f);
+       std::fill(dbi.begin(), dbi.end(), 0.0f);
+       std::fill(dbc.begin(), dbc.end(), 0.0f);
+       std::fill(dbo.begin(), dbo.end(), 0.0f);
+   }
+   // SGD 업데이트
+   void update(float lr) {
+       for (size_t i = 0; i < Wf.size(); i++) {
+           Wf[i] -= lr * dWf[i];
+           Wi[i] -= lr * dWi[i];
+           Wc[i] -= lr * dWc[i];
+           Wo[i] -= lr * dWo[i];
+       }
+       for (size_t i = 0; i < bf.size(); i++) {
+           bf[i] -= lr * dbf[i];
+           bi[i] -= lr * dbi[i];
+           bc[i] -= lr * dbc[i];
+           bo[i] -= lr * dbo[i];
+       }
+   }
+};
+// ========== 시계열의 각 타임스텝에서의 중간 값 보관 ========== //
+struct LSTMCache {
+   // gate outputs
+   std::vector<float> f, i, o, c_tilde;
+   // concat(h_{t-1}, x_t)
+   std::vector<float> concat;
+   // cell state, hidden state
+   std::vector<float> c, h;
+};
+// ========== 순전파 (한 시퀀스 전체) 후 결과를 보관하기 위한 구조 ========== //
+struct LSTMForwardResult {
+   std::vector<LSTMCache> caches; // [seqLen] 크기
+};
+// ------------------------- //
+// 행렬-벡터 곱 + 바이어스 //
+std::vector<float> matVecMulAddBias(const std::vector<float>& W,
+   const std::vector<float>& b,
+   const std::vector<float>& x,
+   int out_dim)
+{
+   // W shape: (in_dim x out_dim), x shape: (in_dim), b shape: (out_dim)
+   // 결과: (out_dim)
+   std::vector<float> result(out_dim, 0.0f);
+   int in_dim = (int)x.size();
+   for (int j = 0; j < out_dim; j++) {
+       float sumVal = 0.f;
+       for (int i = 0; i < in_dim; i++) {
+           sumVal += W[i * out_dim + j] * x[i];
+       }
+       result[j] = sumVal + b[j];
+   }
+   return result;
+}
+// ========== LSTM 순전파(Forward) ========== //
+// inputs: [seqLen][input_dim]
+// 초기 h, c는 0이라 가정(간단화)
+LSTMForwardResult LSTMForwardFunc(const std::vector<std::vector<float>>& inputs,
+   LSTMParam& param)
+{
+   int seqLen = (int)inputs.size();
+   int input_dim = param.input_dim;
+   int hidden_dim = param.hidden_dim;
+   LSTMForwardResult result;
+   result.caches.resize(seqLen);
+   // h_{t-1}, c_{t-1}
+   std::vector<float> h_prev(hidden_dim, 0.0f);
+   std::vector<float> c_prev(hidden_dim, 0.0f);
+   for (int t = 0; t < seqLen; t++) {
+       // 1) concat = [h_{t-1}, x_t]
+       std::vector<float> concat(hidden_dim + input_dim);
+       for (int i = 0; i < hidden_dim; i++) {
+           concat[i] = h_prev[i];
+       }
+       for (int i = 0; i < input_dim; i++) {
+           concat[hidden_dim + i] = inputs[t][i];
+       }
+       // 2) 각 게이트 계산
+       // f_t
+       std::vector<float> f_t = matVecMulAddBias(param.Wf, param.bf, concat, hidden_dim);
+       // i_t
+       std::vector<float> i_t = matVecMulAddBias(param.Wi, param.bi, concat, hidden_dim);
+       // c_tilde_t
+       std::vector<float> c_tilde_t = matVecMulAddBias(param.Wc, param.bc, concat, hidden_dim);
+       // o_t
+       std::vector<float> o_t = matVecMulAddBias(param.Wo, param.bo, concat, hidden_dim);
+       // 3) 활성화 함수 적용
+       for (int j = 0; j < hidden_dim; j++) {
+           f_t[j] = sigmoid(f_t[j]);
+           i_t[j] = sigmoid(i_t[j]);
+           c_tilde_t[j] = tanhf_custom(c_tilde_t[j]);
+           o_t[j] = sigmoid(o_t[j]);
+       }
+       // 4) c_t, h_t 업데이트
+       std::vector<float> c_t(hidden_dim, 0.0f);
+       std::vector<float> h_t(hidden_dim, 0.0f);
+       for (int j = 0; j < hidden_dim; j++) {
+           c_t[j] = f_t[j] * c_prev[j] + i_t[j] * c_tilde_t[j];
+           h_t[j] = o_t[j] * tanhf_custom(c_t[j]);
+       }
+       // 5) cache 저장
+       result.caches[t].f = f_t;
+       result.caches[t].i = i_t;
+       result.caches[t].o = o_t;
+       result.caches[t].c_tilde = c_tilde_t;
+       result.caches[t].concat = concat;
+       result.caches[t].c = c_t;
+       result.caches[t].h = h_t;
+       // 다음 타임스텝으로
+       h_prev = h_t;
+       c_prev = c_t;
+   }
+   return result;
+}
+// ========== LSTM 역전파(Backward) ========== //
+// - inputs: 순전파 때 입력 시계열
+// - forwardRes: 순전파 결과(각 시점별 cache)
+// - dLoss_dh_last: 마지막 시점에 대한 dL/dh (또는 최종 계층에서 역으로 넘어온 값)
+// - dLoss_dc_last: 마지막 시점에 대한 dL/dc
+// - param: (가중치 + 편향 + grad buffer)
+// ※ 여기선 여러 샘플(batch)을 합치지 않고, 1 시퀀스에 대해 BPTT
+void LSTMBackwardFunc(const std::vector<std::vector<float>>& inputs,
+   const LSTMForwardResult& forwardRes,
+   std::vector<float> dLoss_dh_last,
+   std::vector<float> dLoss_dc_last,
+   LSTMParam& param)
+{
+   int seqLen = (int)inputs.size();
+   int hidden_dim = param.hidden_dim;
+   int input_dim = param.input_dim;
+   // h, c의 미분을 t 시점에서 보관
+   std::vector<float> dh_next = dLoss_dh_last; // (이전 시점에 전달할 dh)
+   std::vector<float> dc_next = dLoss_dc_last; // (이전 시점에 전달할 dc)
+   // 역방향으로 순회
+   for (int t = seqLen - 1; t >= 0; t--) {
+       const auto& cache = forwardRes.caches[t];
+       // 미분 계산에 필요한 중간 값
+       const std::vector<float>& f_t = cache.f;
+       const std::vector<float>& i_t = cache.i;
+       const std::vector<float>& o_t = cache.o;
+       const std::vector<float>& c_tilde_t = cache.c_tilde;
+       const std::vector<float>& c_t = cache.c;
+       const std::vector<float>& h_t = cache.h;
+       const std::vector<float>& concat = cache.concat;
+       // 1) dh_t = dh_next + (현재 시점의 dh가 추가로 있다면 합산)
+       std::vector<float> dh_t(hidden_dim, 0.0f);
+       for (int j = 0; j < hidden_dim; j++) {
+           dh_t[j] = dh_next[j];
+       }
+       // 2) dc_t = dc_next + (dh_t * o_t * dtanh(c_t))
+       std::vector<float> dc_t(hidden_dim, 0.0f);
+       for (int j = 0; j < hidden_dim; j++) {
+           float d_tanh_c_t = dtanhf(std::tanh(c_t[j])); // = 1 - tanh^2(c_t[j])
+           dc_t[j] = dc_next[j] + dh_t[j] * o_t[j] * d_tanh_c_t;
+       }
+       // 3) 게이트별 미분
+       // df_t = dc_t * c_{t-1}
+       // di_t = dc_t * c_tilde_t
+       // dc_tilde_t = dc_t * i_t
+       // do_t = dh_t * tanh(c_t)
+       // 단, f_t, i_t, o_t는 sigmoid 미분, c_tilde_t는 tanh 미분
+       std::vector<float> df_t(hidden_dim), di_t(hidden_dim),
+           dc_tilde_t(hidden_dim), do_t(hidden_dim);
+       // c_{t-1} 얻기 위해 (t>0이면 forwardRes.caches[t-1].c, t=0이면 0)
+       const std::vector<float>& c_prev = (t == 0) ?
+           std::vector<float>(hidden_dim, 0.0f) : forwardRes.caches[t - 1].c;
+       for (int j = 0; j < hidden_dim; j++) {
+           df_t[j] = dc_t[j] * c_prev[j] * dsigmoid(f_t[j]);
+           di_t[j] = dc_t[j] * c_tilde_t[j] * dsigmoid(i_t[j]);
+           dc_tilde_t[j] = dc_t[j] * i_t[j] * dtanhf(c_tilde_t[j]);
+           do_t[j] = dh_t[j] * std::tanh(c_t[j]) * dsigmoid(o_t[j]);
+       }
+       // 4) c_{t-1}에 대한 미분 (dc_next) = dc_t * f_t
+       //    (이전 시점으로 흘러가는 dc)
+       for (int j = 0; j < hidden_dim; j++) {
+           dc_next[j] = dc_t[j] * f_t[j];
+       }
+       // 5) concat = [h_{t-1}, x_t]
+       //   => h_{t-1} (앞부분), x_t (뒷부분)
+       // dconcat = Wf^T * df_t + Wi^T * di_t + Wc^T * dc_tilde_t + Wo^T * do_t
+       // 여기서 Wf^T 등은 shape = [hidden_dim, hidden_dim+input_dim]
+       // df_t 등은 shape = [hidden_dim]
+       std::vector<float> dconcat(hidden_dim + input_dim, 0.0f);
+       auto addMatVecMulT = [&](const std::vector<float>& W,
+           const std::vector<float>& dGate) {
+               // W shape: (in_dim x out_dim) = ([hidden_dim+input_dim] x hidden_dim)
+               // dGate shape: [hidden_dim]
+               // result shape: [hidden_dim+input_dim]
+               for (int i = 0; i < hidden_dim + input_dim; i++) {
+                   float sumVal = 0.f;
+                   for (int j = 0; j < hidden_dim; j++) {
+                       // W[i * hidden_dim + j] * dGate[j]
+                       sumVal += W[i * hidden_dim + j] * dGate[j];
+                   }
+                   dconcat[i] += sumVal; // 누적
+               }
+           };
+       addMatVecMulT(param.Wf, df_t);
+       addMatVecMulT(param.Wi, di_t);
+       addMatVecMulT(param.Wc, dc_tilde_t);
+       addMatVecMulT(param.Wo, do_t);
+       // 6) h_{t-1}에 대한 미분 dh_next (다음 루프에 전달)
+       for (int j = 0; j < hidden_dim; j++) {
+           dh_next[j] = dconcat[j];
+       }
+       // 7) x_t에 대한 미분은 dconcat[hidden_dim..] 
+       // (실제 외부로 전파하려면 보관해야 하나, 여기선 업데이트할 파라미터가 없으므로 무시)
+       // 8) 이제 Wf, Wi, Wc, Wo, bf, bi, bc, bo에 대한 미분을 구함
+       // dWf += concat * df_t^T
+       auto accumulateMatGrad = [&](std::vector<float>& dW, std::vector<float>& db,const std::vector<float>& gate_grad) {
+               // dW shape: same as W => (hidden_dim+input_dim) x hidden_dim
+               // concat shape: (hidden_dim+input_dim)
+               // gate_grad shape: (hidden_dim)
+               for (int i = 0; i < hidden_dim + input_dim; i++) {
+                   for (int j = 0; j < hidden_dim; j++) {
+                       dW[i * hidden_dim + j] += concat[i] * gate_grad[j];
+                   }
+               }
+               for (int j = 0; j < hidden_dim; j++) {
+                   db[j] += gate_grad[j];
+               }
+           };
+       accumulateMatGrad(param.dWf, param.bf, df_t);
+       accumulateMatGrad(param.dWi, param.bi, di_t);
+       accumulateMatGrad(param.dWc, param.bc, dc_tilde_t);
+       accumulateMatGrad(param.dWo, param.bo, do_t);
+   }
+}
+// ========== 간단한 출력층(FC Layer) 예시 ========== //
+struct FCParam {
+   std::vector<float> W; // shape: [hidden_dim * 2]
+   std::vector<float> b; // shape: [2]
+   int hidden_dim;
+   std::vector<float> dW; // shape: [hidden_dim * 2]
+   std::vector<float> db; // shape: [2]
+   FCParam(int hid_dim) : hidden_dim(hid_dim) {
+       W.resize(hid_dim * 2);
+       b.resize(2);
+       dW.resize(hid_dim * 2, 0.0f);
+       db.resize(2, 0.0f);
+       std::mt19937 gen(456);
+       std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+       for (auto& val : W) val = dist(gen);
+       for (auto& val : b) val = dist(gen);
+   }
+   void zero_grad() {
+       std::fill(dW.begin(), dW.end(), 0.0f);
+       std::fill(db.begin(), db.end(), 0.0f);
+   }
+   void update(float lr) {
+       for (size_t i = 0; i < W.size(); i++) {
+           W[i] -= lr * dW[i];
+       }
+       for (size_t i = 0; i < b.size(); i++) {
+           b[i] -= lr * db[i];
+       }
+   }
+};
+std::vector<float> forwardFC(const std::vector<float>& h, FCParam& fc) {
+   // h shape: [hidden_dim], output shape: [2]
+   std::vector<float> logits(2, 0.0f);
+   for (int j = 0; j < 2; j++) {
+       float sumVal = 0.f;
+       for (int i = 0; i < fc.hidden_dim; i++) {
+           sumVal += fc.W[i * 2 + j] * h[i];
+       }
+       logits[j] = sumVal + fc.b[j];
+   }
+   return logits;
+}
+// FC 역전파
+// dLogits shape: [2], h shape: [hidden_dim]
+std::vector<float> backwardFC(const std::vector<float>& h,
+   const std::vector<float>& dLogits,
+   FCParam& fc)
+{
+   // 1) dW, db
+   for (int j = 0; j < 2; j++) {
+       for (int i = 0; i < fc.hidden_dim; i++) {
+           fc.dW[i * 2 + j] += h[i] * dLogits[j];
+       }
+       fc.db[j] += dLogits[j];
+   }
+   // 2) dh = W * dLogits
+   //    (hidden_dim)
+   std::vector<float> dH(fc.hidden_dim, 0.f);
+   for (int i = 0; i < fc.hidden_dim; i++) {
+       float sumVal = 0.f;
+       for (int j = 0; j < 2; j++) {
+           sumVal += fc.W[i * 2 + j] * dLogits[j];
+       }
+       dH[i] = sumVal;
+   }
+   return dH;
+}
+// ========== 데모: 간단한 ECG-like 데이터로 LSTM 분류 ========== //
+int main() {
+   // 가상의 ECG 시계열 4개 (seq_len=5, input_dim=1)
+   // label 0: 정상, label 1: 부정맥
+   std::vector<std::vector<std::vector<float>>> ecgData = {
+   {{-0.0495535},{0.200888},{0.293099},{-0.028533},{-0.211503}},
+   {{-0.233631},{0.0189126},{-0.184658},{-0.135368},{0.294217}},
+   {{-0.0225936},{0.151727},{-0.0345324},{0.183804},{0.212669}},
+   {{-0.121336},{0.156224},{0.0415218},{0.23185},{-0.0068506}},
+   {{0.0852375},{0.170285},{0.199978},{-0.19279},{-0.0141844}},
+   {{-0.203637},{-0.099558},{-0.163671},{-0.0066911},{0.0156342}},
+   {{-0.112693},{0.108401},{-0.161717},{0.291392},{-0.150798}},
+   {{-0.014884},{0.161243},{-0.187805},{-0.221946},{0.141046}},
+   {{0.11983},{-0.232998},{0.0452951},{0.17052},{-0.198826}},
+   {{0.0104172},{-0.24684},{0.25111},{0.233536},{0.21874}},
+   {{-0.076587},{-0.111077},{0.0628817},{0.1433},{-0.204537}},
+   {{-0.0353429},{-0.200808},{-0.168949},{0.195293},{0.18122}},
+   {{-0.0194253},{0.199972},{-0.210691},{0.248342},{0.194792}},
+   {{-0.0572571},{-0.207738},{-0.0178791},{-0.29577},{0.140914}},
+   {{-0.0269522},{-0.185584},{-0.187407},{0.292883},{-0.149025}},
+   {{0.2905},{-0.0537734},{0.0804795},{-0.0035505},{0.0713696}},
+   {{-0.208055},{0.204974},{-0.272773},{0.281062},{-0.236959}},
+   {{-0.27343},{0.097122},{-0.054889},{0.0856415},{-0.231855}},
+   {{-0.0296142},{-0.222913},{-0.209595},{-0.148923},{0.0134664}},
+   {{-0.292047},{-0.136166},{-0.0690835},{0.0368628},{0.122895}},
+   {{0.680498},{0.583808},{0.736342},{0.789392},{0.588815}},
+   {{0.636792},{0.978673},{0.970261},{0.641097},{0.702676}},
+   {{0.601199},{0.924129},{0.888896},{0.69312},{0.968251}},
+   {{0.531404},{0.611705},{0.986135},{0.683687},{0.665736}},
+   {{0.616325},{0.798031},{0.997213},{0.745796},{0.555236}},
+   {{0.691206},{0.913012},{0.820307},{0.997594},{0.761562}},
+   {{0.832272},{0.668401},{0.747436},{0.65357},{0.596957}},
+   {{0.561451},{0.793052},{0.512736},{0.582814},{0.694161}},
+   {{0.706349},{0.833481},{0.75955},{0.728212},{0.530949}},
+   {{0.841838},{0.838573},{0.801688},{0.891586},{0.547883}},
+   {{0.710954},{0.782239},{0.588525},{0.976766},{0.596798}},
+   {{0.903016},{0.954012},{0.564529},{0.941551},{0.595937}},
+   {{0.851346},{0.8262},{0.728807},{0.970924},{0.95161}},
+   {{0.743608},{0.95886},{0.642534},{0.770493},{0.848916}},
+   {{0.88446},{0.794713},{0.65679},{0.72122},{0.775238}},
+   {{0.549596},{0.715161},{0.907489},{0.724636},{0.805324}},
+   {{0.80015},{0.728649},{0.757477},{0.574668},{0.790989}},
+   {{0.545661},{0.599331},{0.855008},{0.886753},{0.507365}},
+   {{0.739861},{0.9435},{0.689752},{0.57176},{0.566531}},
+   {{0.794844},{0.853885},{0.945528},{0.841118},{0.513804}}
+   };
+   std::vector<int> labels(40, 0);
+   for (int i = 20; i < 40; i++) labels[i] = 1;
+   int input_dim = 1;
+   int hidden_dim = 8;
+   float lr = 0.02f;
+   int epochs = 1000;
+   int batch_size = 8;
+   // LSTM & FC 파라미터
+   LSTMParam lstmParam(input_dim, hidden_dim);
+   FCParam   fcParam(hidden_dim);
+   for (int epoch = 0; epoch < epochs; epoch++) {
+       float total_loss = 0.0f;
+       // 매 epoch마다 gradient 누적 전 0으로
+       lstmParam.zero_grad();
+       fcParam.zero_grad();
+       for (int i = 0; i < ecgData.size(); i += batch_size) {
+           std::vector<float> dLoss_dh_last(hidden_dim, 0.0f);
+           std::vector<float> dLoss_dc_last(hidden_dim, 0.0f);
+           for (int b = 0; b<batch_size && (i+b) < ecgData.size(); b++){
+                int idx = i + b;
+                // 1) LSTM forward
+                auto fwdRes = LSTMForwardFunc(ecgData[idx], lstmParam);
+                // 마지막 시점 hidden state
+                const auto& h_last = fwdRes.caches.back().h;
+                // 2) FC forward -> logits -> softmax -> loss
+                std::vector<float> logits = forwardFC(h_last, fcParam);
+                std::vector<float> probs = softmax(logits);
+                float loss = cross_entropy(probs, labels[idx]);
+                total_loss += loss;
+                // 3) dLogits = probs - one_hot
+                std::vector<float> dLogits(2, 0.f);
+                for (int c = 0; c < 2; c++) {
+                    dLogits[c] = probs[c] - ((c == labels[idx]) ? 1.f : 0.f);
+                }
+                // 4) FC backward
+                std::vector<float> dH = backwardFC(h_last, dLogits, fcParam);
+                // 5) LSTM backward
+                LSTMBackwardFunc(ecgData[i], fwdRes, dH, dLoss_dc_last, lstmParam);
+            }
+       }
+       // 모든 샘플의 gradient를 합산한 상태 -> 파라미터 업데이트
+       lstmParam.update(lr);
+       fcParam.update(lr);
+       float avg_loss = total_loss / (float)ecgData.size();
+       std::cout << "Epoch " << epoch << " - Loss: " << avg_loss << std::endl;
+   }
+   // 학습 후 예측 확인
+   for (int i = 0; i < ecgData.size(); i++) {
+       auto fwdRes = LSTMForwardFunc(ecgData[i], lstmParam);
+       auto& h_last = fwdRes.caches.back().h;
+       std::vector<float> logits = forwardFC(h_last, fcParam);
+       std::vector<float> probs = softmax(logits);
+       int pred = (probs[1] > probs[0]) ? 1 : 0;
+       std::cout << "[Sample " << i
+           << "] True=" << labels[i]
+           << ", Pred=" << pred
+           << ", Prob(1)=" << probs[1] << std::endl;
+   }
+   return 0;
+}
