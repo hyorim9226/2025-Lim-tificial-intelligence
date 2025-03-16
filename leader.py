@@ -1,41 +1,40 @@
+import machine
+import time
 import ulab.numpy as np
-from machine import Pin, SPI
 
-spi = SPI(0, baudrate=1000000, polarity=0, phase=0)
-cs_pins = [Pin(i, Pin.OUT) for i in range(5, 9)]  
+spi = machine.SPI(0, baudrate=1000000, polarity=0, phase=0)
+cspin = [machine.Pin(5, machine.Pin.OUT), 
+           machine.Pin(6, machine.Pin.OUT), 
+           machine.Pin(7, machine.Pin.OUT), 
+           machine.Pin(8, machine.Pin.OUT)]
 
-class LSTMLeader:
-    def __init__(self, n_h, n_x):
-        self.n_h = n_h
-        self.n_x = n_x
-        self.W_y = np.random.rand(1, n_h) * 0.01
-        self.b_y = np.zeros((1, 1))
-        self.cache = None
+for i in cspin:
+    i.value(1)
 
-    def Communication(self, data, worker_id):
-        cs_pins[worker_id].value(0)  
-        spi.write(data)  
-        result = spi.read(10)  
-        cs_pins[worker_id].value(1)  
-        return np.array(result)  
+n_h, n_x = 10, 5
+h_past = np.random.randn(n_h, 1)
+x_t = np.random.randn(n_x, 1)
+c_past = np.random.randn(n_h, 1)
+hehe = np.vstack((h_past, x_t))
 
-    def forward(self, h_past, x_t, c_past):
-        hehe = np.vstack((h_past, x_t))  
+results = []
+for i in range(4):
+    cspin[i].value(0)
+    time.sleep(0.01)
+    send_str = ",".join(map(str, hehe.flatten()))
+    spi.write(send_str.encode())
+    response = spi.read(128)
+    if response:
+        results.append(np.array([float(x) for x in response.decode().strip().split(",")]).reshape(n_h, 1))
+    cspin[i].value(1)
+    time.sleep(0.01)
 
-        f_t = self.Communication(hehe.tobytes(), 0)  
-        u_t = self.Communication(hehe.tobytes(), 1)
-        headc_t = self.Communication(hehe.tobytes(), 2)
-        o_t = self.Communication(hehe.tobytes(), 3)  
+f_t, u_t, headc_t, o_t = results
+f_t = 1 / (1 + np.exp(-f_t))
+u_t = 1 / (1 + np.exp(-u_t))
+o_t = 1 / (1 + np.exp(-o_t))
+headc_t = (np.exp(headc_t) - np.exp(-headc_t)) / (np.exp(headc_t) + np.exp(-headc_t))
+c_t = f_t * c_past + u_t * headc_t
+h_t = o_t * (np.exp(c_t) - np.exp(-c_t)) / (np.exp(c_t) + np.exp(-c_t))
+#순전파 END;
 
-        c_t = f_t * c_past + u_t * headc_t
-        h_t = o_t * np.tanh(c_t)
-
-        z_t = np.dot(self.W_y, h_t) + self.b_y
-        y_hat = np.exp(z_t) / np.sum(np.exp(z_t), axis=0)
-
-        self.cache = (x_t, h_past, c_past, f_t, u_t, o_t, headc_t, c_t)
-        return h_t, c_t, y_hat
-
-
-n_x, n_h = 5, 10
-lstm = LSTMLeader(n_h, n_x)
